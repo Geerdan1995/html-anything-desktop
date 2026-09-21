@@ -2,6 +2,10 @@ appId: io.nexu.html-anything
 productName: HTML Anything
 copyright: Apache-2.0 © nexu-io — community packaging
 
+# Pinned so electron-builder never needs to detect node_modules/electron
+# (fails on CI where npm's install-scripts guard blocks the postinstall).
+electronVersion: 41.10.7
+
 directories:
   output: ../../dist/desktop-out
 
