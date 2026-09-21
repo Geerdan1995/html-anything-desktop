@@ -24,7 +24,7 @@ const crypto = require("node:crypto");
 const { spawn, execSync } = require("node:child_process");
 const { autoUpdater } = require("electron-updater");
 
-const RELEASE_BASE = "https://github.com/Geerdan1995/html-anything/releases/download";
+const RELEASE_BASE = "https://github.com/Geerdan1995/html-anything-desktop/releases/download";
 // Download routes for the update payload. "" = direct GitHub (fast path with
 // delta downloads when reachable). The rest are CN mirrors of GitHub release
 // assets — integrity is guaranteed by the sha512 from latest.yml (fetched

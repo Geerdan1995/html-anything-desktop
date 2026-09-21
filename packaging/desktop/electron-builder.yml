@@ -22,7 +22,7 @@ files:
 publish:
   provider: github
   owner: Geerdan1995
-  repo: html-anything
+  repo: html-anything-desktop
   releaseType: release
 
 extraResources:
