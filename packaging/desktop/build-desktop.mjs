@@ -87,4 +87,4 @@ if (publish) {
 }
 // Invoke the JS entry directly — the .cmd shim misbehaves under spawnSync.
 sh(process.execPath, builderArgs);
-console.log("[build-desktop] done — installer in packaging/dist/desktop-out");
+console.log("[build-desktop] done — installer in dist/desktop-out");
