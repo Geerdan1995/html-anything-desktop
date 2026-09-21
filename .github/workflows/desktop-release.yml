@@ -133,6 +133,22 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "release version: $VER"
 
+      - name: Pre-create release (idempotent)
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=${{ steps.ver.outputs.version }}
+          # electron-builder's createRelease has a retry race (timeout -> retry
+          # -> 422 on the tag it just created, aborting asset upload). Creating
+          # the release here first makes builder take the "release exists" path
+          # and only upload assets.
+          gh release create "v${VER}" \
+            --target desktop-packaging \
+            --title "${VER}" \
+            --notes "自动构建（上游同步触发）。" \
+            || echo "release already exists — continuing"
+
       - name: Build installer and publish release
         if: steps.changed.outputs.changed == 'true'
         env:
@@ -157,7 +173,10 @@ jobs:
               const sha=crypto.createHash('sha512').update(b).digest('base64');
               fs.writeFileSync('latest.yml', \`version: ${VER}\nfiles:\n  - url: html-anything-setup-${VER}.exe\n    sha512: \${sha}\n    size: \${b.length}\npath: html-anything-setup-${VER}.exe\nsha512: \${sha}\nreleaseDate: '\${new Date().toISOString()}'\n\`);
             "
-            gh release upload "v${VER}" latest.yml "packaging/dist/desktop-out/html-anything-setup-${VER}.exe.blockmap" --clobber || true
+            gh release upload "v${VER}" latest.yml \
+              "packaging/dist/desktop-out/html-anything-setup-${VER}.exe" \
+              "packaging/dist/desktop-out/html-anything-setup-${VER}.exe.blockmap" \
+              --clobber || true
           done
           exit 1
 
