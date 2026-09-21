@@ -1,0 +1,18 @@
+{
+  "name": "html-anything-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "HTML Anything — the agentic HTML editor (desktop shell)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "node build-desktop.mjs"
+  },
+  "devDependencies": {
+    "electron": "^41.3.0",
+    "electron-builder": "^26.0.12"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  }
+}
