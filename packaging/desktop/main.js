@@ -15,7 +15,7 @@
  *     banner dialog → download with progress → silent install → relaunch.
  */
 
-const { app, BrowserWindow, Menu, shell, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, Menu, shell, dialog, ipcMain, session } = require("electron");
 const net = require("node:net");
 const http = require("node:http");
 const path = require("node:path");
@@ -186,6 +186,11 @@ function killServerTree() {
 function setupAutoUpdate() {
   autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = true;
+  // Route updater requests through Electron's net stack so the system proxy
+  // (common on CN networks) is honored for metadata + update downloads.
+  try {
+    autoUpdater.netSession = session.getDefaultSession();
+  } catch {}
   autoUpdater.logger = {
     info: (m) => log(`[updater] ${m}`),
     warn: (m) => log(`[updater] WARN ${m}`),
