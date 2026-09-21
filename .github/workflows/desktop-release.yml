@@ -31,6 +31,10 @@ defaults:
 jobs:
   build-and-release:
     runs-on: windows-latest
+    env:
+      # Pin every gh CLI call to THIS fork — with an `upstream` remote
+      # checked out, gh would otherwise resolve some calls to nexu-io.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout desktop-packaging (full history for rebase)
         uses: actions/checkout@v4
