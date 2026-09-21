@@ -56,3 +56,4 @@ next-env.d.ts
 /packaging/dist/
 /packaging/desktop/node_modules/
 /packaging/desktop/server-payload/
+/dist/
