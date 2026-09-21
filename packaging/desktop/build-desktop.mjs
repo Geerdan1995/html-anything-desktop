@@ -86,5 +86,7 @@ if (publish) {
   builderArgs.push("--publish", "always");
 }
 // Invoke the JS entry directly — the .cmd shim misbehaves under spawnSync.
-sh(process.execPath, builderArgs);
+// cwd is pinned to the project dir so electron-builder.yml is always found,
+// regardless of where this script is invoked from.
+sh(process.execPath, builderArgs, { cwd: HERE });
 console.log("[build-desktop] done — installer in dist/desktop-out");
