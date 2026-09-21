@@ -1,0 +1,167 @@
+name: desktop-release
+
+# Daily auto-release pipeline:
+#   1. Sync fork's main from upstream (nexu-io/html-anything).
+#   2. Rebase desktop-packaging (our one-line standalone patch + packaging/).
+#   3. If upstream has new commits: build + smoke test + publish a release
+#      (setup.exe with auto-update feed, portable zip as bonus asset).
+# Everything runs on GitHub's runners — no local machine involved.
+
+on:
+  schedule:
+    - cron: "30 21 * * *" # 05:30 Beijing time daily
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "即使上游无更新也重新构建并发布"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout desktop-packaging (full history for rebase)
+        uses: actions/checkout@v4
+        with:
+          ref: desktop-packaging
+          fetch-depth: 0
+
+      - name: Sync main from upstream
+        run: |
+          git config user.name "release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git remote add upstream https://github.com/nexu-io/html-anything.git
+          git fetch upstream main
+          git checkout -B main upstream/main
+          git push origin main
+
+      - name: Detect upstream changes
+        id: changed
+        run: |
+          # If desktop-packaging is already rebased onto upstream's newest
+          # commit, there is nothing to build.
+          BASE=$(git merge-base desktop-packaging main)
+          UP=$(git rev-parse upstream/main)
+          echo "rebase-base=$BASE upstream-head=$UP"
+          if [ "$BASE" = "$UP" ] && [ "${{ inputs.force_publish }}" != "true" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No upstream changes since last build — skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commits:"
+            git log --oneline "$BASE..$UP" | head -30 || true
+          fi
+
+      - name: Rebase desktop-packaging onto main
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          git checkout desktop-packaging
+          git rebase main
+          git push origin desktop-packaging --force-with-lease
+
+      - uses: actions/setup-node@v4
+        if: steps.changed.outputs.changed == 'true'
+        with:
+          node-version: "24"
+
+      - name: Install pnpm
+        if: steps.changed.outputs.changed == 'true'
+        run: npm install -g pnpm@10.33.2
+
+      - name: Install workspace deps (hoisted — standalone output must be symlink-free)
+        if: steps.changed.outputs.changed == 'true'
+        run: pnpm install --node-linker=hoisted
+
+      - name: Build Next.js (standalone)
+        if: steps.changed.outputs.changed == 'true'
+        run: pnpm -F @html-anything/next build
+
+      - name: Assemble portable payload
+        if: steps.changed.outputs.changed == 'true'
+        run: node packaging/portable/build-portable.mjs --no-zip
+
+      - name: Smoke test — server boots and API answers
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          cd packaging/dist/html-anything-portable/app/next
+          PORT=3777 HOSTNAME=127.0.0.1 NODE_ENV=production node server.js &
+          SRV=$!
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 3 http://127.0.0.1:3777/api/agents || true)
+            if [ "$code" = "200" ]; then echo "smoke OK"; kill $SRV; exit 0; fi
+            sleep 2
+          done
+          echo "smoke FAILED (server did not answer)"
+          kill $SRV || true
+          exit 1
+
+      - name: Compute version (YY.MDD.N)
+        if: steps.changed.outputs.changed == 'true'
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Y=$(date -u +%Y); M=$(date -u +%m); D=$(date -u +%d)
+          YY=$((10#${Y:2})); MDD=$((10#$M * 100 + 10#$D))
+          N=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name | startswith(\"v${YY}.${MDD}.\"))] | length + 1")
+          VER="${YY}.${MDD}.${N}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "release version: $VER"
+
+      - name: Build installer and publish release
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DESKTOP_VERSION: ${{ steps.ver.outputs.version }}
+        run: node packaging/desktop/build-desktop.mjs --publish
+
+      - name: Verify release feed (latest.yml must exist and match)
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=${{ steps.ver.outputs.version }}
+          for i in 1 2 3; do
+            ASSETS=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/v${VER}" --jq '[.assets[].name]' || true)
+            echo "assets: $ASSETS"
+            if echo "$ASSETS" | grep -q latest.yml; then echo "feed OK"; exit 0; fi
+            echo "latest.yml missing — repairing"
+            node -e "
+              const fs=require('fs'),crypto=require('crypto');
+              const b=fs.readFileSync('packaging/dist/desktop-out/html-anything-setup-${VER}.exe');
+              const sha=crypto.createHash('sha512').update(b).digest('base64');
+              fs.writeFileSync('latest.yml', \`version: ${VER}\nfiles:\n  - url: html-anything-setup-${VER}.exe\n    sha512: \${sha}\n    size: \${b.length}\npath: html-anything-setup-${VER}.exe\nsha512: \${sha}\nreleaseDate: '\${new Date().toISOString()}'\n\`);
+            "
+            gh release upload "v${VER}" latest.yml "packaging/dist/desktop-out/html-anything-setup-${VER}.exe.blockmap" --clobber || true
+          done
+          exit 1
+
+      - name: Attach portable zip and release notes
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=${{ steps.ver.outputs.version }}
+          node packaging/portable/build-portable.mjs
+          ZIP=$(ls packaging/dist/html-anything-win-x64-portable-*.zip | head -1)
+          gh release upload "v${VER}" "$ZIP" --clobber
+          BASE=$(git merge-base desktop-packaging main)
+          NOTES="$(git log --oneline --no-decorate "${BASE}..origin/main" | head -20)"
+          gh release edit "v${VER}" --notes "上游更新：
+
+          ${NOTES}
+
+          安装包与绿色版均由 Actions 自动构建。已安装桌面版的用户会自动收到更新提示。" || true
