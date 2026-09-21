@@ -15,13 +15,22 @@
  *     banner dialog → download with progress → silent install → relaunch.
  */
 
-const { app, BrowserWindow, Menu, shell, dialog, ipcMain, session } = require("electron");
-const net = require("node:net");
+const { app, BrowserWindow, Menu, shell, dialog, ipcMain, session, net } = require("electron");
+const net2 = require("node:net");
 const http = require("node:http");
 const path = require("node:path");
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const { spawn, execSync } = require("node:child_process");
 const { autoUpdater } = require("electron-updater");
+
+const RELEASE_BASE = "https://github.com/Geerdan1995/html-anything/releases/download";
+// Download routes for the update payload. "" = direct GitHub (fast path with
+// delta downloads when reachable). The rest are CN mirrors of GitHub release
+// assets — integrity is guaranteed by the sha512 from latest.yml (fetched
+// and verified per route), so a misbehaving mirror cannot serve tampered
+// bits. If a mirror dies, replace it here.
+const MIRROR_PREFIXES = ["", "https://ghfast.top/", "https://ghproxy.net/", "https://gh-proxy.com/"];
 
 const BASE_PORT = 3000;
 const MAX_PORT_OFFSET = 25;
@@ -36,6 +45,8 @@ let serverRestarts = 0;
 let quitting = false;
 let updateProgressWindow = null;
 let checkingForUpdate = false;
+let updatePhase = "idle"; // idle | updater-download | fallback | installing
+let pendingUpdateVersion = null;
 
 function payloadRoot() {
   return app.isPackaged
@@ -86,7 +97,7 @@ function findFreePort() {
         reject(new Error("no free port in 3000-3025"));
         return;
       }
-      const srv = net.createServer();
+      const srv = net2.createServer();
       srv.once("error", () => tryPort(port + 1, offset + 1));
       srv.once("listening", () => srv.close(() => resolve(port)));
       srv.listen(port, "127.0.0.1");
@@ -221,6 +232,7 @@ function setupAutoUpdate() {
   });
 
   autoUpdater.on("download-progress", (progress) => {
+    if (updatePhase !== "updater-download") return;
     const pct = Math.round(progress.percent || 0);
     if (updateProgressWindow && !updateProgressWindow.isDestroyed()) {
       updateProgressWindow.setProgressBar(progress.percent ? progress.percent / 100 : -1);
@@ -235,6 +247,7 @@ function setupAutoUpdate() {
 
   autoUpdater.on("update-downloaded", () => {
     log("update downloaded — installing and restarting");
+    updatePhase = "installing";
     if (updateProgressWindow && !updateProgressWindow.isDestroyed()) {
       updateProgressWindow.webContents
         .executeJavaScript(`document.getElementById('t').textContent='安装中，即将重启…'`)
@@ -246,9 +259,12 @@ function setupAutoUpdate() {
 
   autoUpdater.on("error", (err) => {
     log(`[updater] error: ${err && err.message}`);
+    // During updater-download the downloadUpdate() promise rejection drives
+    // the fallback chain; don't double-handle here.
+    if (updatePhase === "updater-download" || quitting) return;
     if (updateProgressWindow && !updateProgressWindow.isDestroyed()) updateProgressWindow.close();
     if (process.env.HTML_ANYTHING_AUTOUPDATE === "1") return;
-    dialog.showErrorBox("更新失败", `${err && err.message}\n\n可稍后在 帮助 → 检查更新 重试。`);
+    showUpdateFailureDialog(String(err && err.message));
   });
 
   checkForUpdates(true);
@@ -279,12 +295,159 @@ function checkForUpdates(silent) {
     })
     .catch((err) => {
       checkingForUpdate = false;
-      if (!silent) dialog.showErrorBox("检查更新失败", String(err && err.message));
+      log(`[updater] check failed: ${err && err.message}`);
+      if (silent) return; // periodic checks fail quietly, retried later
+      dialog.showMessageBox(mainWindow, {
+        type: "warning",
+        title: "检查更新失败",
+        message: "无法连接 GitHub 检查更新",
+        detail: `${err && err.message}\n\n如果你有代理工具（如 Clash），请打开后再试；也可以直接到 Releases 页面手动下载。`,
+        buttons: ["好的"],
+      });
     });
 }
 
+function setUpdateStatus(title, percentText, taskbarRatio) {
+  if (!updateProgressWindow || updateProgressWindow.isDestroyed()) return;
+  if (title) updateProgressWindow.webContents.executeJavaScript(`document.getElementById('t').textContent='${title}'`).catch(() => {});
+  if (percentText) updateProgressWindow.webContents.executeJavaScript(`document.getElementById('p').textContent='${percentText}'`).catch(() => {});
+  updateProgressWindow.setProgressBar(taskbarRatio ?? -1);
+}
+
+/** Fetch a URL via Electron's net stack (honors system proxy), redirect-aware. */
+function netFetch(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const req = net.request(url);
+    const chunks = [];
+    let received = 0;
+    let total = 0;
+    let lastActivity = Date.now();
+    const stallMs = opts.stallMs ?? 30_000;
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastActivity > stallMs) {
+        clearInterval(watchdog);
+        try { req.abort(); } catch {}
+        reject(new Error(`stalled after ${Math.round(stallMs / 1000)}s without data`));
+      }
+    }, 2000);
+    const fail = (e) => {
+      clearInterval(watchdog);
+      reject(e);
+    };
+    req.on("response", (res) => {
+      if (res.statusCode !== 200) {
+        fail(new Error(`HTTP ${res.statusCode}`));
+        res.resume();
+        return;
+      }
+      const len = res.headers["content-length"];
+      total = len ? parseInt(String(len), 10) : 0;
+      res.on("data", (c) => {
+        chunks.push(c);
+        received += c.length;
+        lastActivity = Date.now();
+        if (opts.onProgress) opts.onProgress(received, total);
+      });
+      res.on("end", () => {
+        clearInterval(watchdog);
+        resolve(Buffer.concat(chunks));
+      });
+      res.on("error", fail);
+    });
+    req.on("error", fail);
+    req.end();
+  });
+}
+
+function parseLatestYml(text) {
+  const pick = (re) => {
+    const m = text.match(re);
+    return m ? m[1] : null;
+  };
+  const url = pick(/^path:\s*(\S+)/m) || pick(/^\s+- url:\s*(\S+)/m);
+  const sha512 = pick(/^sha512:\s*(\S+)/m);
+  if (!url || !sha512) throw new Error("latest.yml parse failed");
+  return { url, sha512 };
+}
+
+/**
+ * Fallback path when electron-updater's own download fails: fetch the update
+ * through mirror prefixes in order. Each route downloads latest.yml + the
+ * installer and verifies the installer's sha512 against latest.yml before
+ * running it, so mirror integrity is enforced.
+ */
+async function mirrorDownloadUpdate(version) {
+  const mb = (n) => (n / 1048576).toFixed(1);
+  let lastErr = null;
+  for (const prefix of MIRROR_PREFIXES) {
+    const route = prefix === "" ? "GitHub 直连" : `备用线路 ${prefix}`;
+    try {
+      setUpdateStatus(`正在下载新版本 ${version}`, `${route} · 读取更新信息…`, -1);
+      const ymlUrl = `${prefix}${RELEASE_BASE}/v${version}/latest.yml`;
+      const ymlBuf = await netFetch(ymlUrl, { stallMs: 12_000 });
+      const yml = parseLatestYml(ymlBuf.toString("utf8"));
+      const exeUrl = `${prefix}${RELEASE_BASE}/v${version}/${yml.url}`;
+      setUpdateStatus(`正在下载新版本 ${version}`, `${route} · 连接中…`, -1);
+      const exeBuf = await netFetch(exeUrl, {
+        onProgress: (r, t) => {
+          const pct = t ? Math.round((r / t) * 100) : 0;
+          setUpdateStatus(null, `${route} · ${pct}%（${mb(r)} / ${mb(t)} MB）`, t ? r / t : -1);
+        },
+      });
+      const sha = crypto.createHash("sha512").update(exeBuf).digest("base64");
+      if (sha !== yml.sha512) throw new Error("sha512 mismatch — route served corrupted file");
+      const dest = path.join(app.getPath("temp"), yml.url);
+      fs.writeFileSync(dest, exeBuf);
+      log(`[updater] mirror route ${route} ok (${mb(exeBuf.length)} MB), sha512 verified`);
+      return dest;
+    } catch (e) {
+      lastErr = e;
+      log(`[updater] route ${route} failed: ${e && e.message}`);
+    }
+  }
+  throw lastErr || new Error("all download routes failed");
+}
+
+function runDownloadedInstaller(file) {
+  updatePhase = "installing";
+  setUpdateStatus("安装中，即将重启…", null, -1);
+  log(`[updater] executing installer ${file}`);
+  quitting = true;
+  const child = spawn(file, ["--updated", "/S", "--force-run"], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.on("error", (e) => {
+    log(`[updater] installer spawn failed: ${e.message}`);
+    quitting = false;
+    updatePhase = "idle";
+  });
+  child.unref();
+  setTimeout(() => app.quit(), 800);
+}
+
+function showUpdateFailureDialog(detail) {
+  dialog
+    .showMessageBox(mainWindow, {
+      type: "warning",
+      title: "更新下载失败",
+      message: "新版本下载失败：所有线路（GitHub 直连 + 备用线路）都没能连上",
+      detail: `${detail}\n\n常见原因与办法：\n· 网络屏蔽了 GitHub —— 打开你的代理工具（如 Clash）后点「重试」通常即可\n· 也可能是临时网络波动，稍后再试\n\n当前版本可继续正常使用，不影响日常功能。`,
+      buttons: ["重试", "以后再说"],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    .then((r) => {
+      if (r.response === 0 && pendingUpdateVersion) startUpdateDownload(pendingUpdateVersion);
+    })
+    .catch(() => {});
+}
+
 function startUpdateDownload(version) {
+  pendingUpdateVersion = version;
   log(`starting update download to ${version}`);
+  updatePhase = "updater-download";
   updateProgressWindow = new BrowserWindow({
     width: 420,
     height: 160,
@@ -314,7 +477,33 @@ function startUpdateDownload(version) {
         </body></html>`,
       ),
   );
-  autoUpdater.downloadUpdate().catch(() => {});
+
+  const fallbackToMirrors = (reason) => {
+    log(`updater fast path failed (${reason}) — falling back to mirror routes`);
+    if (quitting || updatePhase === "installing") return;
+    updatePhase = "fallback";
+    setUpdateStatus(`正在下载新版本 ${version}`, "直连失败，自动切换备用线路…", -1);
+    mirrorDownloadUpdate(version)
+      .then(runDownloadedInstaller)
+      .catch((e) => {
+        if (quitting || updatePhase === "installing") return;
+        updatePhase = "idle";
+        if (updateProgressWindow && !updateProgressWindow.isDestroyed()) updateProgressWindow.close();
+        log(`[updater] all routes failed: ${e && e.message}`);
+        if (process.env.HTML_ANYTHING_AUTOUPDATE === "1") return;
+        showUpdateFailureDialog(String(e && e.message));
+      });
+  };
+
+  // Test hook: force the mirror path even when the fast path would work.
+  if (process.env.HTML_ANYTHING_FORCE_FALLBACK === "1") {
+    fallbackToMirrors("forced for testing");
+    return;
+  }
+  autoUpdater.downloadUpdate().catch((err) => {
+    if (updatePhase !== "updater-download") return; // already fell back / installing
+    fallbackToMirrors(String(err && err.message));
+  });
 }
 
 ipcMain.handle("app:get-version", () => ({ version: app.getVersion(), commit: payloadCommit() }));
