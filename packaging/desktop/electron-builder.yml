@@ -1,0 +1,48 @@
+appId: io.nexu.html-anything
+productName: HTML Anything
+copyright: Apache-2.0 © nexu-io — community packaging
+
+directories:
+  output: ../../dist/desktop-out
+
+# Only the shell goes into asar; the server payload must stay on-disk
+# (extraResources) because the Node-mode child process cannot read asar.
+files:
+  - main.js
+  - preload.js
+  - loader.html
+  - icon.png
+
+# Auto-update feed: electron-updater reads latest.yml from these releases.
+# releaseType must be "release" — drafts are invisible to the updater.
+publish:
+  provider: github
+  owner: Geerdan1995
+  repo: html-anything
+  releaseType: release
+
+extraResources:
+  # filter is required: without it electron-builder drops directories named
+  # node_modules from extraResources copies (known behavior).
+  - from: server-payload
+    to: server-payload
+    filter:
+      - "**/*"
+
+win:
+  target: nsis
+  icon: icon.png
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: HTML Anything
+  artifactName: html-anything-setup-${version}.${ext}
+
+# Trim Electron's locale packs; the app UI is zh/en.
+electronLanguages:
+  - zh-CN
+  - en-US
